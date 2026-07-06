@@ -5,8 +5,8 @@ edition = "2021"
 rust-version = "1.75"
 description = "Rust notifier for Errorgap error tracking."
 license = "MIT"
-repository = "https://gitlab.jgrubbs.net/jGRUBBS/errorgap-rust"
-homepage = "https://gitlab.jgrubbs.net/jGRUBBS/errorgap-rust"
+repository = "https://github.com/errorgaphq/errorgap-rust"
+homepage = "https://github.com/errorgaphq/errorgap-rust"
 keywords = ["errorgap", "error-tracking", "observability", "tower", "tracing"]
 categories = ["development-tools::debugging", "asynchronous"]
 
