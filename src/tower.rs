@@ -84,8 +84,7 @@ where
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
             Poll::Ready(Err(err)) => {
-                let opts = NoticeOptions::default()
-                    .with_context("source", "tower::ErrorgapLayer");
+                let opts = NoticeOptions::default().with_context("source", "tower::ErrorgapLayer");
                 let _ = notify(&err);
                 drop(opts);
                 Poll::Ready(Err(err))

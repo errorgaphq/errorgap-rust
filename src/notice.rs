@@ -21,6 +21,10 @@ pub struct NoticeOptions {
     pub session: Map<String, Value>,
     /// Request/job params (filtered before delivery).
     pub params: Map<String, Value>,
+    /// Breadcrumbs attached as `context.breadcrumbs`. The package-level
+    /// [`crate::notify`] / [`crate::notify_error`] set this from the global
+    /// buffer automatically.
+    pub breadcrumbs: Vec<Value>,
 }
 
 impl NoticeOptions {
@@ -63,12 +67,53 @@ impl Notice {
         config: &Configuration,
         options: NoticeOptions,
     ) -> Self {
+        Self::build_parts(
+            short_type_name::<E>(),
+            format!("{error}"),
+            Vec::new(),
+            config,
+            options,
+        )
+    }
+
+    /// Build a notice from a `std::error::Error`, flattening its `source()`
+    /// chain into `context.causes`.
+    pub(crate) fn build_error<E: std::error::Error>(
+        error: &E,
+        config: &Configuration,
+        options: NoticeOptions,
+    ) -> Self {
+        Self::build_parts(
+            short_type_name::<E>(),
+            format!("{error}"),
+            collect_causes(error.source()),
+            config,
+            options,
+        )
+    }
+
+    fn build_parts(
+        type_name: String,
+        message: String,
+        causes: Vec<Value>,
+        config: &Configuration,
+        options: NoticeOptions,
+    ) -> Self {
         let mut context = Map::new();
         context.insert("notifier".into(), Value::String(NOTIFIER_ID.into()));
         context.insert("notifier_version".into(), Value::String(VERSION.into()));
-        context.insert("environment".into(), Value::String(config.environment().into()));
+        context.insert(
+            "environment".into(),
+            Value::String(config.environment().into()),
+        );
         if let Some(release) = config.release() {
             context.insert("release".into(), Value::String(release.into()));
+        }
+        if !causes.is_empty() {
+            context.insert("causes".into(), Value::Array(causes));
+        }
+        if !options.breadcrumbs.is_empty() {
+            context.insert("breadcrumbs".into(), Value::Array(options.breadcrumbs));
         }
         for (k, v) in options.context {
             context.insert(k, v);
@@ -78,22 +123,56 @@ impl Notice {
         let session: Map<String, Value> = options.session;
         let params = filter::filter(&options.params, config.filter_keys());
 
-        let backtrace = backtrace::capture();
+        let backtrace = backtrace::capture(config.root_directory());
         let error_entry = ErrorEntry {
-            r#type: short_type_name::<E>(),
-            message: format!("{error}"),
+            r#type: type_name,
+            message,
             backtrace,
         };
 
         Notice {
             project_id: config.project_id().map(String::from),
-            received_at: chrono_like_now(),
+            received_at: now_rfc3339(),
             errors: vec![error_entry],
             context,
             environment,
             session,
             params,
         }
+    }
+}
+
+/// Walk a `source()` chain into `[{type, message}]`, nearest cause first.
+///
+/// Concrete cause types are not recoverable from `&dyn Error`, so `type` is a
+/// best-effort label taken from the leading identifier of the `Debug` form.
+fn collect_causes(mut source: Option<&(dyn std::error::Error + 'static)>) -> Vec<Value> {
+    let mut causes = Vec::new();
+    let mut depth = 0;
+    while let Some(err) = source {
+        if depth >= 10 {
+            break;
+        }
+        let mut entry = Map::new();
+        entry.insert("type".into(), Value::String(cause_type(err)));
+        entry.insert("message".into(), Value::String(format!("{err}")));
+        causes.push(Value::Object(entry));
+        source = err.source();
+        depth += 1;
+    }
+    causes
+}
+
+fn cause_type(err: &(dyn std::error::Error + 'static)) -> String {
+    let debug = format!("{err:?}");
+    let ident: String = debug
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() {
+        "Error".to_string()
+    } else {
+        ident
     }
 }
 
@@ -107,7 +186,7 @@ fn short_type_name<T: ?Sized>() -> String {
 ///
 /// `std::time::SystemTime` can't format on its own; this helper formats the
 /// Unix timestamp using the same epoch logic the rest of the SDK relies on.
-fn chrono_like_now() -> String {
+pub(crate) fn now_rfc3339() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

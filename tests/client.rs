@@ -171,3 +171,154 @@ async fn rejects_missing_project_slug() {
         Err(errorgap::ErrorgapError::MissingProjectSlug)
     ));
 }
+
+#[derive(Debug)]
+struct RootError;
+
+impl std::fmt::Display for RootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("orders database unreachable")
+    }
+}
+
+impl std::error::Error for RootError {}
+
+#[derive(Debug)]
+struct CheckoutError {
+    source: RootError,
+}
+
+impl std::fmt::Display for CheckoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("checkout failed")
+    }
+}
+
+impl std::error::Error for CheckoutError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[tokio::test]
+async fn records_cause_chain_in_context() {
+    let (addr, state, stop) = start_ingestor().await;
+
+    let config = Configuration::builder()
+        .endpoint(format!("http://{}", addr))
+        .project_slug("demo")
+        .api_key("flk_test")
+        .is_async(true)
+        .build()
+        .unwrap();
+    let client = Client::new(config).unwrap();
+
+    client.notify_error(
+        &CheckoutError { source: RootError },
+        NoticeOptions::default(),
+    );
+    client.flush().await;
+
+    let req = state.requests().pop().expect("a request");
+    let body = req.body.as_object().unwrap();
+    let errors = body.get("errors").unwrap().as_array().unwrap();
+    assert_eq!(errors[0]["type"], "CheckoutError");
+    assert_eq!(errors[0]["message"], "checkout failed");
+    let causes = body["context"]["causes"].as_array().unwrap();
+    assert_eq!(causes.len(), 1);
+    assert_eq!(causes[0]["type"], "RootError");
+    assert_eq!(causes[0]["message"], "orders database unreachable");
+
+    let _ = stop.send(());
+}
+
+#[tokio::test]
+async fn posts_apm_transaction() {
+    let (addr, state, stop) = start_ingestor().await;
+
+    let config = Configuration::builder()
+        .endpoint(format!("http://{}", addr))
+        .project_slug("demo")
+        .api_key("flk_test")
+        .is_async(true)
+        .apm_enabled(true)
+        .apm_sample_rate(1.0)
+        .build()
+        .unwrap();
+    let client = Client::new(config).unwrap();
+
+    let mut spans = errorgap::SpanCollector::new();
+    spans.database("SELECT * FROM orders WHERE id = 7", 4.0);
+    spans.external(30.0);
+    let txn = errorgap::Transaction::web("GET", "/orders/{id}", "/orders/7")
+        .status_code(200)
+        .duration_ms(42.0)
+        .spans(spans);
+
+    let result = client.notify_transaction(txn);
+    assert!(result.queued);
+    client.flush().await;
+
+    let req = state.requests().pop().expect("a request");
+    assert_eq!(req.path, "/api/projects/demo/transactions");
+    assert_eq!(req.body["kind"], "web");
+    assert_eq!(req.body["path"], "/orders/{id}");
+    assert_eq!(req.body["path_raw"], "/orders/7");
+    assert_eq!(req.body["spans"].as_array().unwrap().len(), 2);
+
+    let _ = stop.send(());
+}
+
+#[tokio::test]
+async fn skips_apm_when_disabled() {
+    let config = Configuration::builder()
+        .endpoint("http://127.0.0.1:1")
+        .project_slug("demo")
+        .apm_enabled(false)
+        .build()
+        .unwrap();
+    let client = Client::new(config).unwrap();
+    let result = client.notify_transaction(errorgap::Transaction::job("J", "default"));
+    assert_eq!(result.status, Some(204));
+    assert!(!result.queued);
+}
+
+#[tokio::test]
+async fn posts_structured_log() {
+    let (addr, state, stop) = start_ingestor().await;
+
+    let config = Configuration::builder()
+        .endpoint(format!("http://{}", addr))
+        .project_slug("demo")
+        .api_key("flk_test")
+        .is_async(true)
+        .build()
+        .unwrap();
+    let client = Client::new(config).unwrap();
+
+    let result = client.notify_log("gateway timeout", "error", Some("payments"));
+    assert!(result.queued);
+    client.flush().await;
+
+    let req = state.requests().pop().expect("a request");
+    assert_eq!(req.path, "/api/projects/demo/logs");
+    assert_eq!(req.body["message"], "gateway timeout");
+    assert_eq!(req.body["level"], "error");
+    assert_eq!(req.body["source"], "payments");
+
+    let _ = stop.send(());
+}
+
+#[tokio::test]
+async fn drops_log_below_minimum_level() {
+    let config = Configuration::builder()
+        .endpoint("http://127.0.0.1:1")
+        .project_slug("demo")
+        .minimum_log_level("warn")
+        .build()
+        .unwrap();
+    let client = Client::new(config).unwrap();
+    let result = client.notify_log("chatty", "info", None);
+    assert_eq!(result.status, Some(204));
+    assert!(!result.queued);
+}

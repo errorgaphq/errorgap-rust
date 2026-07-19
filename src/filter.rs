@@ -36,10 +36,17 @@ mod tests {
     use serde_json::json;
 
     fn defaults() -> Vec<String> {
-        vec!["password", "token", "secret", "api_key", "authorization", "cookie"]
-            .into_iter()
-            .map(String::from)
-            .collect()
+        vec![
+            "password",
+            "token",
+            "secret",
+            "api_key",
+            "authorization",
+            "cookie",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     }
 
     fn map(value: Value) -> Map<String, Value> {
