@@ -22,7 +22,7 @@ errorgap = "0.2"
 Or, to skip the tower / tracing integrations:
 
 ```toml
-errorgap = { version = "0.1", default-features = false }
+errorgap = { version = "0.2", default-features = false }
 ```
 
 ## Configure
