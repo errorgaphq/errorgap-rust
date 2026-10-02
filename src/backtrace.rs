@@ -43,6 +43,12 @@ pub(crate) fn capture(root: Option<&str>) -> Vec<Frame> {
     parse_backtrace_text(&bt.to_string(), root)
 }
 
+/// Frames from a backtrace rendered elsewhere (see
+/// `NoticeOptions::with_backtrace`).
+pub(crate) fn from_text(text: &str, root: Option<&str>) -> Vec<Frame> {
+    parse_backtrace_text(text, root)
+}
+
 /// Parse a `Backtrace::to_string()` rendering into [`Frame`]s.
 fn parse_backtrace_text(text: &str, root: Option<&str>) -> Vec<Frame> {
     let mut frames = Vec::new();
@@ -80,8 +86,11 @@ fn parse_backtrace_text(text: &str, root: Option<&str>) -> Vec<Frame> {
     frames
 }
 
-/// Frames belonging to the capture machinery or the SDK itself. Trait/impl
-/// methods render as `<errorgap::Type>::method`, so match by substring.
+/// Leading frames that are machinery, not the failure: the capture itself,
+/// the SDK, and — for a backtrace an error recorded at creation — the error
+/// library and the `?` conversion into it. Only the leading run is dropped, so
+/// these never hide a frame from the middle of a trace. Trait/impl methods
+/// render as `<crate::Type>::method`, so match by substring.
 fn is_internal_frame(frame: &Frame) -> bool {
     let Some(func) = frame.function.as_deref() else {
         return false;
@@ -89,6 +98,9 @@ fn is_internal_frame(frame: &Frame) -> bool {
     func.contains("errorgap::")
         || func.contains("backtrace_rs")
         || func.contains("std::backtrace::")
+        || func.contains("anyhow::")
+        || func.starts_with("core::")
+        || func.starts_with("<core::")
 }
 
 fn make_frame(
@@ -236,6 +248,43 @@ fn is_in_app(file: Option<&str>, function: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_supplied_backtrace_starts_at_the_failing_code() {
+        // Shaped like an `anyhow::Error` backtrace taken when `?` converted a
+        // `reqwest::Error`: capture and conversion frames first, then the app.
+        let text = "\
+   0: std::backtrace_rs::backtrace::libunwind::trace
+             at /rustc/abc/library/std/src/../../backtrace/src/backtrace/libunwind.rs:116:5
+   1: std::backtrace::Backtrace::create
+             at /rustc/abc/library/std/src/backtrace.rs:331:13
+   2: anyhow::error::<impl core::convert::From<E> for anyhow::Error>::from
+             at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.98/src/error.rs:555:25
+   3: <core::result::Result<T,F> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible,E>>>::from_residual
+             at /rustc/abc/library/core/src/result.rs:2009:27
+   4: errorgap_api::routes::projects::proxy_project_log::{{closure}}
+             at /workspace/apps/api/src/routes/projects.rs:515:20
+   5: axum::handler::Handler::call::{{closure}}
+             at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.7.9/src/handler/mod.rs:208:55";
+        let frames = from_text(text, Some("/workspace"));
+        assert_eq!(
+            frames[0].function.as_deref(),
+            Some("errorgap_api::routes::projects::proxy_project_log::{{closure}}")
+        );
+        assert_eq!(
+            frames[0].file.as_deref(),
+            Some("apps/api/src/routes/projects.rs")
+        );
+        assert_eq!(frames[0].line, Some(515));
+        assert!(frames[0].in_app);
+        assert_eq!(frames[0].index, 0);
+        // Dependencies below it are kept, as vendor frames.
+        assert_eq!(
+            frames[1].file.as_deref(),
+            Some("axum-0.7.9/src/handler/mod.rs")
+        );
+        assert!(!frames[1].in_app);
+    }
 
     #[test]
     fn parses_frame_with_location() {

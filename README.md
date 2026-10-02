@@ -16,13 +16,13 @@ Requires Rust 1.75+.
 
 ```toml
 [dependencies]
-errorgap = "0.2"
+errorgap = "0.3"
 ```
 
 Or, to skip the tower / tracing integrations:
 
 ```toml
-errorgap = { version = "0.2", default-features = false }
+errorgap = { version = "0.3", default-features = false }
 ```
 
 ## Configure
@@ -63,6 +63,22 @@ if let Err(err) = risky().await {
 
 `notify` never panics. Returns a `DeliveryResult` (`status`, `body`,
 `error`, `queued`).
+
+### Backtraces from where the error happened
+
+A notice's backtrace is captured where `notify` is called, which for an error
+reported from a central handler is the handler, not the failure. If the error
+recorded a backtrace when it was created — `anyhow::Error` does with
+`RUST_LIB_BACKTRACE=1` — pass that instead:
+
+```rust
+let options = errorgap::NoticeOptions::default().with_backtrace(err.backtrace());
+errorgap::notify_with(&err, options);
+```
+
+Leading frames from the error library and the `?` conversion are dropped, so
+the top frame is the code that failed. Build release binaries with
+`debug = "line-tables-only"` to keep file and line numbers.
 
 ## Axum / Tower
 
