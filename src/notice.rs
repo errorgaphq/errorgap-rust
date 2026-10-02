@@ -25,6 +25,9 @@ pub struct NoticeOptions {
     /// [`crate::notify`] / [`crate::notify_error`] set this from the global
     /// buffer automatically.
     pub breadcrumbs: Vec<Value>,
+    /// A backtrace rendered elsewhere, used instead of capturing one at the
+    /// notify call site. Set it with [`NoticeOptions::with_backtrace`].
+    pub backtrace: Option<String>,
 }
 
 impl NoticeOptions {
@@ -37,6 +40,18 @@ impl NoticeOptions {
     /// Add a `params` field.
     pub fn with_param(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.params.insert(key.into(), value.into());
+        self
+    }
+
+    /// Report this backtrace instead of one captured where `notify` is
+    /// called — typically the backtrace an error recorded when it was created
+    /// (e.g. `anyhow::Error::backtrace()` with `RUST_LIB_BACKTRACE=1`), so the
+    /// top frame is where the error happened, not where it was reported.
+    /// Ignored unless the backtrace was actually captured.
+    pub fn with_backtrace(mut self, backtrace: &std::backtrace::Backtrace) -> Self {
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            self.backtrace = Some(backtrace.to_string());
+        }
         self
     }
 }
@@ -123,7 +138,10 @@ impl Notice {
         let session: Map<String, Value> = options.session;
         let params = filter::filter(&options.params, config.filter_keys());
 
-        let backtrace = backtrace::capture(config.root_directory());
+        let backtrace = match options.backtrace.as_deref() {
+            Some(text) => backtrace::from_text(text, config.root_directory()),
+            None => backtrace::capture(config.root_directory()),
+        };
         let error_entry = ErrorEntry {
             r#type: type_name,
             message,
@@ -227,6 +245,38 @@ fn format_rfc3339(secs: i64, millis: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_supplied_backtrace_replaces_the_call_site_capture() {
+        let config = Configuration::builder()
+            .endpoint("http://localhost")
+            .project_slug("demo")
+            .api_key("k")
+            .root_directory("/workspace")
+            .build()
+            .unwrap();
+        let options = NoticeOptions {
+            backtrace: Some(
+                "   0: my_api::handler\n             at /workspace/src/handler.rs:12:5\n"
+                    .to_string(),
+            ),
+            ..NoticeOptions::default()
+        };
+        let notice = Notice::build(&"boom", &config, options);
+        let frames = &notice.errors[0].backtrace;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].file.as_deref(), Some("src/handler.rs"));
+        assert_eq!(frames[0].line, Some(12));
+    }
+
+    #[test]
+    fn an_uncaptured_backtrace_is_ignored() {
+        let disabled = std::backtrace::Backtrace::disabled();
+        assert!(NoticeOptions::default()
+            .with_backtrace(&disabled)
+            .backtrace
+            .is_none());
+    }
 
     #[test]
     fn rfc3339_known_value() {

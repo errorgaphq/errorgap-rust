@@ -38,7 +38,7 @@ use parking_lot::RwLock;
 use serde_json::{Map, Value};
 
 /// SDK version, embedded in every notice's User-Agent header.
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.3.0";
 
 static DEFAULT_CLIENT: OnceCell<RwLock<Option<Client>>> = OnceCell::new();
 static BREADCRUMBS: OnceCell<RwLock<BreadcrumbBuffer>> = OnceCell::new();
