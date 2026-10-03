@@ -89,6 +89,7 @@ impl SpanCollector {
 /// (`kind = "job"`).
 #[derive(Debug, Clone)]
 pub struct Transaction {
+    id: String,
     kind: String,
     method: Option<String>,
     path: Option<String>,
@@ -111,6 +112,7 @@ impl Transaction {
         path_raw: impl Into<String>,
     ) -> Self {
         Transaction {
+            id: new_transaction_id(),
             kind: "web".into(),
             method: Some(method.into()),
             path: Some(path.into()),
@@ -128,6 +130,7 @@ impl Transaction {
     /// A background-job transaction for the given job class and queue.
     pub fn job(job_class: impl Into<String>, queue: impl Into<String>) -> Self {
         Transaction {
+            id: new_transaction_id(),
             kind: "job".into(),
             method: None,
             path: None,
@@ -140,6 +143,13 @@ impl Transaction {
             job_class: Some(job_class.into()),
             queue: Some(queue.into()),
         }
+    }
+
+    /// This transaction's id. Errors reported inside
+    /// [`in_transaction`]/[`in_transaction_sync`] with it carry it as
+    /// `context.transaction_id`, which links them to this request in errorgap.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// Set the HTTP status code.
@@ -174,6 +184,7 @@ impl Transaction {
 
     pub(crate) fn payload(&self, default_environment: &str, now: impl Fn() -> String) -> Value {
         let mut map = Map::new();
+        map.insert("id".into(), Value::String(self.id.clone()));
         map.insert("kind".into(), Value::String(self.kind.clone()));
         map.insert(
             "duration_ms".into(),
@@ -217,6 +228,59 @@ impl Transaction {
         }
         Value::Object(map)
     }
+}
+
+fn new_transaction_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+tokio::task_local! {
+    static CURRENT_TRANSACTION: String;
+}
+
+thread_local! {
+    static CURRENT_TRANSACTION_SYNC: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The id of the transaction the current task (or, outside a task scope, the
+/// current thread) is running in, if any.
+pub fn current_transaction_id() -> Option<String> {
+    CURRENT_TRANSACTION
+        .try_with(Clone::clone)
+        .ok()
+        .or_else(|| CURRENT_TRANSACTION_SYNC.with(|cell| cell.borrow().clone()))
+}
+
+/// Run `future` as part of a transaction: errors reported while it runs carry
+/// the transaction's id as `context.transaction_id`. Task-local, so
+/// concurrent requests on one thread never see each other's id.
+///
+/// ```no_run
+/// # async fn handle() {}
+/// # async fn example() {
+/// let transaction = errorgap::Transaction::web("GET", "/orders/{id}", "/orders/7");
+/// let response = errorgap::in_transaction(transaction.id(), handle()).await;
+/// errorgap::notify_transaction(transaction.status_code(200));
+/// # }
+/// ```
+pub async fn in_transaction<F: std::future::Future>(id: impl Into<String>, future: F) -> F::Output {
+    CURRENT_TRANSACTION.scope(id.into(), future).await
+}
+
+/// [`in_transaction`] for synchronous code: the id is current on this thread
+/// while `f` runs, and the previous one is restored after.
+pub fn in_transaction_sync<R>(id: impl Into<String>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            CURRENT_TRANSACTION_SYNC.with(|cell| *cell.borrow_mut() = previous);
+        }
+    }
+    let previous = CURRENT_TRANSACTION_SYNC.with(|cell| cell.borrow_mut().replace(id.into()));
+    let _restore = Restore(previous);
+    f()
 }
 
 /// Strip literals so query shapes aggregate: `'…'` and numbers become `?`.

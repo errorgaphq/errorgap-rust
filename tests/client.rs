@@ -322,3 +322,102 @@ async fn drops_log_below_minimum_level() {
     assert_eq!(result.status, Some(204));
     assert!(!result.queued);
 }
+
+fn apm_client(addr: SocketAddr) -> Client {
+    let config = Configuration::builder()
+        .endpoint(format!("http://{}", addr))
+        .project_slug("demo")
+        .api_key("egp_test")
+        .is_async(true)
+        .apm_enabled(true)
+        .apm_sample_rate(1.0)
+        .build()
+        .unwrap();
+    Client::new(config).unwrap()
+}
+
+/// Errors reported inside a transaction carry its id, so errorgap shows the
+/// error the request raised and links the occurrence to its trace.
+#[tokio::test]
+async fn errors_inside_a_transaction_carry_its_id() {
+    let (addr, state, stop) = start_ingestor().await;
+    let client = apm_client(addr);
+
+    let txn = errorgap::Transaction::web("GET", "/orders/{id}", "/orders/7");
+    let id = txn.id().to_string();
+    assert_eq!(id.len(), 36, "a canonical uuid: {id}");
+
+    let inner = client.clone();
+    errorgap::in_transaction(id.clone(), async move {
+        inner.notify("boom", NoticeOptions::default());
+    })
+    .await;
+    // Outside the scope there is no current transaction.
+    client.notify("after", NoticeOptions::default());
+    client.notify_transaction(txn.status_code(500).duration_ms(12.0));
+    client.flush().await;
+
+    let requests = state.requests();
+    let notice = |message: &str| {
+        requests
+            .iter()
+            .find(|r| r.path.ends_with("/notices") && r.body["errors"][0]["message"] == message)
+            .expect("notice")
+            .body
+            .clone()
+    };
+    assert_eq!(notice("boom")["context"]["transaction_id"], id);
+    assert!(notice("after")["context"].get("transaction_id").is_none());
+    let transaction = requests
+        .iter()
+        .find(|r| r.path.ends_with("/transactions"))
+        .expect("transaction");
+    assert_eq!(transaction.body["id"], id);
+
+    let _ = stop.send(());
+}
+
+#[tokio::test]
+async fn concurrent_transactions_keep_their_own_ids() {
+    let (a, b) = tokio::join!(
+        errorgap::in_transaction("a", async {
+            tokio::task::yield_now().await;
+            errorgap::current_transaction_id()
+        }),
+        errorgap::in_transaction("b", async {
+            tokio::task::yield_now().await;
+            errorgap::current_transaction_id()
+        }),
+    );
+    assert_eq!(a.as_deref(), Some("a"));
+    assert_eq!(b.as_deref(), Some("b"));
+    assert_eq!(errorgap::current_transaction_id(), None);
+}
+
+#[test]
+fn sync_scopes_nest_and_restore() {
+    let seen = errorgap::in_transaction_sync("outer", || {
+        let inner = errorgap::in_transaction_sync("inner", errorgap::current_transaction_id);
+        (inner, errorgap::current_transaction_id())
+    });
+    assert_eq!(seen, (Some("inner".into()), Some("outer".into())));
+    assert_eq!(errorgap::current_transaction_id(), None);
+}
+
+#[tokio::test]
+async fn an_explicit_transaction_id_wins() {
+    let (addr, state, stop) = start_ingestor().await;
+    let client = apm_client(addr);
+    let inner = client.clone();
+    errorgap::in_transaction("scoped", async move {
+        inner.notify(
+            "x",
+            NoticeOptions::default().with_context("transaction_id", "mine"),
+        );
+    })
+    .await;
+    client.flush().await;
+    let notice = state.requests().pop().expect("notice");
+    assert_eq!(notice.body["context"]["transaction_id"], "mine");
+    let _ = stop.send(());
+}

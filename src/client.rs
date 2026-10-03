@@ -128,7 +128,7 @@ impl Client {
     /// In sync mode (`is_async = false`) the queue is unused — call
     /// [`notify_sync`](Self::notify_sync) from an async context instead.
     pub fn notify<E: std::fmt::Display>(&self, error: E, options: NoticeOptions) -> DeliveryResult {
-        let notice = Notice::build(&error, &self.inner.config, options);
+        let notice = Notice::build(&error, &self.inner.config, with_transaction(options));
         self.enqueue_notice(notice)
     }
 
@@ -139,7 +139,7 @@ impl Client {
         error: &E,
         options: NoticeOptions,
     ) -> DeliveryResult {
-        let notice = Notice::build_error(error, &self.inner.config, options);
+        let notice = Notice::build_error(error, &self.inner.config, with_transaction(options));
         self.enqueue_notice(notice)
     }
 
@@ -158,7 +158,7 @@ impl Client {
         error: E,
         options: NoticeOptions,
     ) -> DeliveryResult {
-        let notice = Notice::build(&error, &self.inner.config, options);
+        let notice = Notice::build(&error, &self.inner.config, with_transaction(options));
         self.deliver_sync(Resource::Notices, &notice).await
     }
 
@@ -359,4 +359,15 @@ async fn deliver_inner(
     let status = response.status().as_u16();
     let text = response.text().await.unwrap_or_default();
     Ok((status, text))
+}
+
+/// Attach the current transaction's id (see [`crate::in_transaction`]) unless
+/// the caller set one, so errorgap links the error to its request.
+fn with_transaction(mut options: NoticeOptions) -> NoticeOptions {
+    if !options.context.contains_key("transaction_id") {
+        if let Some(id) = crate::apm::current_transaction_id() {
+            options.context.insert("transaction_id".into(), id.into());
+        }
+    }
+    options
 }
