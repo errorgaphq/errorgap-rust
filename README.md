@@ -16,13 +16,13 @@ Requires Rust 1.75+.
 
 ```toml
 [dependencies]
-errorgap = "0.3"
+errorgap = "0.4"
 ```
 
 Or, to skip the tower / tracing integrations:
 
 ```toml
-errorgap = { version = "0.3", default-features = false }
+errorgap = { version = "0.4", default-features = false }
 ```
 
 ## Configure
@@ -161,6 +161,28 @@ errorgap::notify_transaction(
 
 `path` is the normalized route template used for grouping; `path_raw` is the
 concrete URL. APM delivery requires `apm_enabled` (default `true`).
+
+### Link errors to their request
+
+Every transaction has an id. Run the request's work inside
+`errorgap::in_transaction` and errors reported there carry it as
+`context.transaction_id`, so errorgap shows the error a request actually raised
+on its trace and links each occurrence to its request:
+
+```rust
+let transaction = Transaction::web("GET", "/orders/{id}", "/orders/7");
+let started = std::time::Instant::now();
+let response = errorgap::in_transaction(transaction.id(), handler(request)).await;
+errorgap::notify_transaction(
+    transaction
+        .status_code(response.status().as_u16() as i32)
+        .duration_ms(started.elapsed().as_secs_f64() * 1000.0),
+);
+```
+
+The scope is task-local, so concurrent requests never share an id;
+`errorgap::in_transaction_sync` does the same for synchronous code, and
+`errorgap::current_transaction_id()` returns the id in effect.
 
 ## Configuration reference
 

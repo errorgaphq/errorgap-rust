@@ -26,7 +26,10 @@ pub mod tower;
 #[cfg(feature = "tracing")]
 pub mod tracing;
 
-pub use apm::{normalize_sql, Span, SpanCollector, Transaction};
+pub use apm::{
+    current_transaction_id, in_transaction, in_transaction_sync, normalize_sql, Span,
+    SpanCollector, Transaction,
+};
 pub use client::{Client, DeliveryResult};
 pub use config::{Configuration, ConfigurationBuilder};
 pub use error::ErrorgapError;
