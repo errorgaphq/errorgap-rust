@@ -90,6 +90,7 @@ impl SpanCollector {
 #[derive(Debug, Clone)]
 pub struct Transaction {
     id: String,
+    trace_id: Option<String>,
     kind: String,
     method: Option<String>,
     path: Option<String>,
@@ -113,6 +114,7 @@ impl Transaction {
     ) -> Self {
         Transaction {
             id: new_transaction_id(),
+            trace_id: None,
             kind: "web".into(),
             method: Some(method.into()),
             path: Some(path.into()),
@@ -131,6 +133,7 @@ impl Transaction {
     pub fn job(job_class: impl Into<String>, queue: impl Into<String>) -> Self {
         Transaction {
             id: new_transaction_id(),
+            trace_id: None,
             kind: "job".into(),
             method: None,
             path: None,
@@ -150,6 +153,14 @@ impl Transaction {
     /// `context.transaction_id`, which links them to this request in errorgap.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Record the `x-errorgap-trace` header a browser SDK sent with this
+    /// request, linking the browser's view of the call to this transaction.
+    /// Ignored unless it is a well-formed UUID (see [`browser_trace_id`]).
+    pub fn trace_id(mut self, header: impl AsRef<str>) -> Self {
+        self.trace_id = browser_trace_id(header.as_ref());
+        self
     }
 
     /// Set the HTTP status code.
@@ -185,6 +196,9 @@ impl Transaction {
     pub(crate) fn payload(&self, default_environment: &str, now: impl Fn() -> String) -> Value {
         let mut map = Map::new();
         map.insert("id".into(), Value::String(self.id.clone()));
+        if let Some(v) = &self.trace_id {
+            map.insert("trace_id".into(), Value::String(v.clone()));
+        }
         map.insert("kind".into(), Value::String(self.kind.clone()));
         map.insert(
             "duration_ms".into(),
@@ -228,6 +242,19 @@ impl Transaction {
         }
         Value::Object(map)
     }
+}
+
+/// The header the errorgap browser SDK sends with API calls.
+pub const TRACE_HEADER: &str = "x-errorgap-trace";
+
+/// The trace id in an `x-errorgap-trace` header value, lowercased, or `None`
+/// unless it is a well-formed UUID.
+pub fn browser_trace_id(header: &str) -> Option<String> {
+    let value = header.trim();
+    uuid::Uuid::try_parse(value)
+        .ok()
+        .filter(|_| value.len() == 36)
+        .map(|uuid| uuid.hyphenated().to_string())
 }
 
 fn new_transaction_id() -> String {
@@ -344,6 +371,25 @@ mod tests {
         assert_eq!(value["sql"], "SELECT * FROM t WHERE id = ?");
         assert_eq!(value["fn_name"], "Repo::load");
         assert_eq!(value["duration_ms"], 12.5);
+    }
+
+    #[test]
+    fn browser_trace_ids_must_be_uuids() {
+        let txn = Transaction::web("GET", "/o/{id}", "/o/7")
+            .trace_id(" 0192F3C4-7A1B-4C2D-9E3F-0123456789AB ");
+        let payload = txn.payload("production", || "now".into());
+        assert_eq!(payload["trace_id"], "0192f3c4-7a1b-4c2d-9e3f-0123456789ab");
+        assert_ne!(payload["trace_id"], payload["id"]);
+        for bad in [
+            "not-a-uuid",
+            "0192f3c47a1b4c2d9e3f0123456789ab",
+            "{0192f3c4-7a1b-4c2d-9e3f-0123456789ab}",
+        ] {
+            let payload = Transaction::web("GET", "/", "/")
+                .trace_id(bad)
+                .payload("p", || "now".into());
+            assert!(payload.get("trace_id").is_none(), "{bad}");
+        }
     }
 
     #[test]

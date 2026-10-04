@@ -16,13 +16,13 @@ Requires Rust 1.75+.
 
 ```toml
 [dependencies]
-errorgap = "0.4"
+errorgap = "0.5"
 ```
 
 Or, to skip the tower / tracing integrations:
 
 ```toml
-errorgap = { version = "0.4", default-features = false }
+errorgap = { version = "0.5", default-features = false }
 ```
 
 ## Configure
@@ -183,6 +183,11 @@ errorgap::notify_transaction(
 The scope is task-local, so concurrent requests never share an id;
 `errorgap::in_transaction_sync` does the same for synchronous code, and
 `errorgap::current_transaction_id()` returns the id in effect.
+
+When the errorgap browser SDK is on the page, its API calls send an
+`x-errorgap-trace` header (`errorgap::TRACE_HEADER`). Pass it to
+`Transaction::trace_id(header)` and errorgap's browser Performance view links
+each call to the server request that answered it; malformed values are ignored.
 
 ## Configuration reference
 
