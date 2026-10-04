@@ -27,8 +27,8 @@ pub mod tower;
 pub mod tracing;
 
 pub use apm::{
-    current_transaction_id, in_transaction, in_transaction_sync, normalize_sql, Span,
-    SpanCollector, Transaction,
+    browser_trace_id, current_transaction_id, in_transaction, in_transaction_sync, normalize_sql,
+    Span, SpanCollector, Transaction, TRACE_HEADER,
 };
 pub use client::{Client, DeliveryResult};
 pub use config::{Configuration, ConfigurationBuilder};
