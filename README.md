@@ -16,7 +16,7 @@ Requires Rust 1.75+.
 
 ```toml
 [dependencies]
-errorgap = "0.5"
+errorgap = "0.6"
 ```
 
 Or, to skip the tower / tracing integrations:
@@ -79,6 +79,25 @@ errorgap::notify_with(&err, options);
 Leading frames from the error library and the `?` conversion are dropped, so
 the top frame is the code that failed. Build release binaries with
 `debug = "line-tables-only"` to keep file and line numbers.
+
+## Filtering, hooks and delivery
+
+```rust
+let config = Configuration::builder()
+    .project_slug("my-app")
+    .ignore_environments(["test"])
+    .before_notify(|notice| {
+        // `notice` is the JSON about to be sent; return false to drop it
+        notice["context"]["team"] = "billing".into();
+        true
+    })
+    .build()?;
+```
+
+Filter keys are masked at any depth in `params` and `session`, inside arrays
+too. A send that fails on the network or with a 5xx is retried up to three
+times; after a 429 the client stops sending for the server's `Retry-After`
+(`client.paused()`).
 
 ## Axum / Tower
 

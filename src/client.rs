@@ -48,6 +48,17 @@ pub struct DeliveryResult {
 }
 
 impl DeliveryResult {
+    /// Deliberately not sent: an ignored environment, or dropped by
+    /// `before_notify`. Reported as HTTP 204 with nothing queued.
+    pub(crate) fn skipped() -> Self {
+        DeliveryResult {
+            status: Some(204),
+            body: None,
+            error: None,
+            queued: false,
+        }
+    }
+
     pub(crate) fn error(error: ErrorgapError) -> Self {
         DeliveryResult {
             status: None,
@@ -77,6 +88,77 @@ struct Inner {
     http: reqwest::Client,
     tx: Option<mpsc::Sender<(Resource, Value)>>,
     pending: Arc<AtomicUsize>,
+    pause: Arc<Pause>,
+}
+
+const MAX_ATTEMPTS: u32 = 3;
+const RETRY_DELAY: Duration = Duration::from_secs(30);
+const BACKLOG_SIZE: usize = 100;
+const DEFAULT_RETRY_AFTER: u64 = 60;
+const MAX_RETRY_AFTER: u64 = 300;
+
+/// Sending is paused until `until` (unix milliseconds) after a 429 or 503.
+#[derive(Default)]
+struct Pause {
+    until: std::sync::atomic::AtomicU64,
+    backlog: AtomicUsize,
+}
+
+impl Pause {
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn active(&self) -> bool {
+        Self::now() < self.until.load(Ordering::SeqCst)
+    }
+
+    fn start(&self, retry_after: Option<&str>) {
+        let seconds = retry_after
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_RETRY_AFTER)
+            .clamp(1, MAX_RETRY_AFTER);
+        self.until
+            .store(Self::now() + seconds * 1000, Ordering::SeqCst);
+    }
+}
+
+/// Network failures and 5xx responses are worth another try. A 4xx is not:
+/// the server understood and refused, and after a 429 the payload is dropped
+/// so a limited project is not sent the same burst again.
+fn retryable(result: &Result<(u16, String), ErrorgapError>) -> bool {
+    match result {
+        Ok((status, _)) => *status >= 500,
+        Err(ErrorgapError::Delivery(_)) => true,
+        Err(_) => false,
+    }
+}
+
+/// Try again later, off the delivery worker, up to `MAX_ATTEMPTS` in all.
+fn retry_later(
+    http: reqwest::Client,
+    config: Configuration,
+    pause: Arc<Pause>,
+    resource: Resource,
+    body: Value,
+) {
+    if pause.backlog.load(Ordering::SeqCst) >= BACKLOG_SIZE {
+        return;
+    }
+    pause.backlog.fetch_add(1, Ordering::SeqCst);
+    tokio::spawn(async move {
+        for attempt in 1..MAX_ATTEMPTS {
+            tokio::time::sleep(RETRY_DELAY * attempt).await;
+            let result = deliver_inner(&http, &config, &pause, resource, &body).await;
+            if !retryable(&result) {
+                break;
+            }
+        }
+        pause.backlog.fetch_sub(1, Ordering::SeqCst);
+    });
 }
 
 impl Client {
@@ -89,15 +171,27 @@ impl Client {
             .map_err(ErrorgapError::Delivery)?;
 
         let pending: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let pause: Arc<Pause> = Arc::new(Pause::default());
 
         let tx = if config.is_async() {
             let (tx, mut rx) = mpsc::channel::<(Resource, Value)>(config.queue_size());
             let http_clone = http.clone();
             let cfg_clone = config.clone();
             let pending_clone = pending.clone();
+            let pause_clone = pause.clone();
             tokio::spawn(async move {
                 while let Some((resource, body)) = rx.recv().await {
-                    let _ = deliver_inner(&http_clone, &cfg_clone, resource, &body).await;
+                    let result =
+                        deliver_inner(&http_clone, &cfg_clone, &pause_clone, resource, &body).await;
+                    if retryable(&result) {
+                        retry_later(
+                            http_clone.clone(),
+                            cfg_clone.clone(),
+                            pause_clone.clone(),
+                            resource,
+                            body,
+                        );
+                    }
                     pending_clone.fetch_sub(1, Ordering::SeqCst);
                 }
             });
@@ -112,6 +206,7 @@ impl Client {
                 http,
                 tx,
                 pending,
+                pause,
             }),
         })
     }
@@ -144,10 +239,40 @@ impl Client {
     }
 
     fn enqueue_notice(&self, notice: Notice) -> DeliveryResult {
-        match serde_json::to_value(&notice) {
-            Ok(value) => self.enqueue(Resource::Notices, value),
-            Err(e) => DeliveryResult::error(ErrorgapError::Encoding(e)),
+        match self.prepare(&notice) {
+            Ok(Some(value)) => self.enqueue(Resource::Notices, value),
+            Ok(None) => DeliveryResult::skipped(),
+            Err(e) => DeliveryResult::error(e),
         }
+    }
+
+    /// The notice as JSON after `before_notify`, or `None` when the hook
+    /// dropped it or the environment is ignored. A hook that panics is
+    /// skipped: a bug in a filter must not lose the error it was filtering.
+    fn prepare(&self, notice: &Notice) -> Result<Option<Value>, ErrorgapError> {
+        if self.inner.config.ignored_environment() {
+            return Ok(None);
+        }
+        let mut value = serde_json::to_value(notice).map_err(ErrorgapError::Encoding)?;
+        if let Some(hook) = self.inner.config.before_notify() {
+            let mut candidate = value.clone();
+            let kept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let keep = (hook.0)(&mut candidate);
+                (keep, candidate)
+            }));
+            match kept {
+                Ok((false, _)) => return Ok(None),
+                Ok((true, changed)) => value = changed,
+                Err(_) => {}
+            }
+        }
+        Ok(Some(value))
+    }
+
+    /// True while delivery is paused at the server's request (a 429 or 503
+    /// with `Retry-After`).
+    pub fn paused(&self) -> bool {
+        self.inner.pause.active()
     }
 
     /// Deliver synchronously from within an async context. Use this in tests
@@ -159,7 +284,11 @@ impl Client {
         options: NoticeOptions,
     ) -> DeliveryResult {
         let notice = Notice::build(&error, &self.inner.config, with_transaction(options));
-        self.deliver_sync(Resource::Notices, &notice).await
+        match self.prepare(&notice) {
+            Ok(Some(value)) => self.deliver_value_sync(Resource::Notices, value).await,
+            Ok(None) => DeliveryResult::skipped(),
+            Err(e) => DeliveryResult::error(e),
+        }
     }
 
     /// Queue an APM transaction (a web interaction or a background job).
@@ -243,6 +372,9 @@ impl Client {
     }
 
     fn enqueue(&self, resource: Resource, value: Value) -> DeliveryResult {
+        if self.inner.config.ignored_environment() {
+            return DeliveryResult::skipped();
+        }
         let Some(tx) = &self.inner.tx else {
             // Sync mode without an explicit await — direct callers to *_sync.
             return DeliveryResult::error(ErrorgapError::NotInitialized);
@@ -264,15 +396,19 @@ impl Client {
         }
     }
 
-    async fn deliver_sync(&self, resource: Resource, notice: &Notice) -> DeliveryResult {
-        match serde_json::to_value(notice) {
-            Ok(value) => self.deliver_value_sync(resource, value).await,
-            Err(e) => DeliveryResult::error(ErrorgapError::Encoding(e)),
-        }
-    }
-
     async fn deliver_value_sync(&self, resource: Resource, value: Value) -> DeliveryResult {
-        match deliver_inner(&self.inner.http, &self.inner.config, resource, &value).await {
+        if self.inner.config.ignored_environment() {
+            return DeliveryResult::skipped();
+        }
+        match deliver_inner(
+            &self.inner.http,
+            &self.inner.config,
+            &self.inner.pause,
+            resource,
+            &value,
+        )
+        .await
+        {
             Ok((status, body)) => DeliveryResult {
                 status: Some(status),
                 body: Some(body),
@@ -331,9 +467,13 @@ fn sample(rate: f64) -> bool {
 async fn deliver_inner(
     http: &reqwest::Client,
     config: &Configuration,
+    pause: &Pause,
     resource: Resource,
     body: &Value,
 ) -> Result<(u16, String), ErrorgapError> {
+    if pause.active() {
+        return Err(ErrorgapError::RateLimited);
+    }
     let url = format!(
         "{}/api/projects/{}/{}",
         config.endpoint().trim_end_matches('/'),
@@ -357,6 +497,13 @@ async fn deliver_inner(
 
     let response = req.send().await.map_err(ErrorgapError::Delivery)?;
     let status = response.status().as_u16();
+    if status == 429 || status == 503 {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok());
+        pause.start(retry_after);
+    }
     let text = response.text().await.unwrap_or_default();
     Ok((status, text))
 }
