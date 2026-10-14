@@ -73,12 +73,16 @@ async fn start_ingestor() -> (SocketAddr, Arc<CaptureState>, oneshot::Sender<()>
                                 let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
                                 let body_json: serde_json::Value =
                                     serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
-                                state.record(CapturedRequest {
-                                    method,
-                                    path,
-                                    headers,
-                                    body: body_json,
-                                });
+                                // The SDK's settings poll is not an ingest
+                                // request: not recorded.
+                                if method != "GET" {
+                                    state.record(CapturedRequest {
+                                        method,
+                                        path,
+                                        headers,
+                                        body: body_json,
+                                    });
+                                }
                                 let response = Response::builder()
                                     .status(StatusCode::CREATED)
                                     .header("content-type", "application/json")

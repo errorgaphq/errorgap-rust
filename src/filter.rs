@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 const FILTERED: &str = "[FILTERED]";
 
 /// Return a new map with any key whose name contains a filtered substring
-/// replaced with `"[FILTERED]"`. Recurses into nested objects.
+/// replaced with `"[FILTERED]"`. Recurses into nested objects and arrays.
 pub(crate) fn filter(params: &Map<String, Value>, filter_keys: &[String]) -> Map<String, Value> {
     let lowered: Vec<String> = filter_keys.iter().map(|k| k.to_lowercase()).collect();
     walk(params, &lowered)
@@ -16,18 +16,29 @@ fn walk(input: &Map<String, Value>, lowered: &[String]) -> Map<String, Value> {
     for (key, value) in input {
         if is_sensitive(key, lowered) {
             out.insert(key.clone(), Value::String(FILTERED.into()));
-        } else if let Value::Object(nested) = value {
-            out.insert(key.clone(), Value::Object(walk(nested, lowered)));
         } else {
-            out.insert(key.clone(), value.clone());
+            out.insert(key.clone(), walk_value(value, lowered));
         }
     }
     out
 }
 
+/// Objects are walked wherever they sit, including inside arrays.
+fn walk_value(value: &Value, lowered: &[String]) -> Value {
+    match value {
+        Value::Object(nested) => Value::Object(walk(nested, lowered)),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| walk_value(item, lowered)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 fn is_sensitive(key: &str, lowered: &[String]) -> bool {
     let lk = key.to_lowercase();
-    lowered.iter().any(|needle| lk.contains(needle.as_str()))
+    lowered
+        .iter()
+        .any(|needle| !needle.is_empty() && lk.contains(needle.as_str()))
 }
 
 #[cfg(test)]

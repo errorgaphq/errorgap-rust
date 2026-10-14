@@ -135,7 +135,7 @@ impl Notice {
         }
 
         let environment: Map<String, Value> = options.environment;
-        let session: Map<String, Value> = options.session;
+        let session = filter::filter(&options.session, config.filter_keys());
         let params = filter::filter(&options.params, config.filter_keys());
 
         let backtrace = match options.backtrace.as_deref() {

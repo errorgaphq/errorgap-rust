@@ -1,6 +1,9 @@
 //! Configuration for the Errorgap SDK.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use serde_json::Value;
 
 use crate::ErrorgapError;
 
@@ -15,6 +18,17 @@ pub const DEFAULT_FILTER_KEYS: &[&str] = &[
     "authorization",
     "cookie",
 ];
+
+/// A hook that sees each notice (as JSON) before it is sent. It may change
+/// the notice; returning `false` drops it.
+#[derive(Clone)]
+pub struct BeforeNotify(pub(crate) Arc<dyn Fn(&mut Value) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for BeforeNotify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BeforeNotify(..)")
+    }
+}
 
 /// SDK configuration.
 #[derive(Debug, Clone)]
@@ -35,6 +49,9 @@ pub struct Configuration {
     pub(crate) logs_enabled: bool,
     pub(crate) minimum_log_level: String,
     pub(crate) max_breadcrumbs: usize,
+    pub(crate) ignore_environments: Vec<String>,
+    pub(crate) before_notify: Option<BeforeNotify>,
+    pub(crate) remote_settings: bool,
 }
 
 impl Configuration {
@@ -92,6 +109,21 @@ impl Configuration {
         &self.minimum_log_level
     }
 
+    /// True when nothing should be sent from the configured environment.
+    pub(crate) fn ignored_environment(&self) -> bool {
+        self.ignore_environments
+            .iter()
+            .any(|name| name == &self.environment)
+    }
+
+    pub(crate) fn remote_settings(&self) -> bool {
+        self.remote_settings
+    }
+
+    pub(crate) fn before_notify(&self) -> Option<&BeforeNotify> {
+        self.before_notify.as_ref()
+    }
+
     pub(crate) fn max_breadcrumbs(&self) -> usize {
         self.max_breadcrumbs
     }
@@ -132,6 +164,9 @@ pub struct ConfigurationBuilder {
     logs_enabled: Option<bool>,
     minimum_log_level: Option<String>,
     max_breadcrumbs: Option<usize>,
+    ignore_environments: Option<Vec<String>>,
+    before_notify: Option<BeforeNotify>,
+    remote_settings: Option<bool>,
 }
 
 impl ConfigurationBuilder {
@@ -235,6 +270,35 @@ impl ConfigurationBuilder {
         self
     }
 
+    /// Environments in which nothing is sent. Defaults to
+    /// `ERRORGAP_IGNORE_ENVIRONMENTS` (comma-separated).
+    pub fn ignore_environments<I, S>(mut self, environments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.ignore_environments = Some(environments.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Follow the project's settings in errorgap (Project settings › What
+    /// SDKs send): stop sending what is switched off there. On by default;
+    /// `ERRORGAP_REMOTE_SETTINGS=false` turns it off.
+    pub fn remote_settings(mut self, follow: bool) -> Self {
+        self.remote_settings = Some(follow);
+        self
+    }
+
+    /// See each notice (as JSON) before it is sent. Change it in place;
+    /// return `false` to drop it.
+    pub fn before_notify<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&mut Value) -> bool + Send + Sync + 'static,
+    {
+        self.before_notify = Some(BeforeNotify(Arc::new(hook)));
+        self
+    }
+
     /// Set whether delivery is async (background channel) or sync.
     pub fn is_async(mut self, is_async: bool) -> Self {
         self.is_async = Some(is_async);
@@ -301,6 +365,21 @@ impl ConfigurationBuilder {
             logs_enabled: self.logs_enabled.unwrap_or(true),
             minimum_log_level: self.minimum_log_level.unwrap_or_else(|| "info".to_string()),
             max_breadcrumbs: self.max_breadcrumbs.unwrap_or(25),
+            ignore_environments: self.ignore_environments.unwrap_or_else(|| {
+                std::env::var("ERRORGAP_IGNORE_ENVIRONMENTS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            }),
+            before_notify: self.before_notify,
+            remote_settings: self.remote_settings.unwrap_or_else(|| {
+                !std::env::var("ERRORGAP_REMOTE_SETTINGS")
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case("false")
+            }),
         })
     }
 }

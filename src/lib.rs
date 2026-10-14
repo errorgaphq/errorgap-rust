@@ -31,7 +31,7 @@ pub use apm::{
     Span, SpanCollector, Transaction, TRACE_HEADER,
 };
 pub use client::{Client, DeliveryResult};
-pub use config::{Configuration, ConfigurationBuilder};
+pub use config::{BeforeNotify, Configuration, ConfigurationBuilder};
 pub use error::ErrorgapError;
 pub use notice::{Notice, NoticeOptions};
 
@@ -41,7 +41,7 @@ use parking_lot::RwLock;
 use serde_json::{Map, Value};
 
 /// SDK version, embedded in every notice's User-Agent header.
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static DEFAULT_CLIENT: OnceCell<RwLock<Option<Client>>> = OnceCell::new();
 static BREADCRUMBS: OnceCell<RwLock<BreadcrumbBuffer>> = OnceCell::new();
