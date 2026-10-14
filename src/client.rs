@@ -89,7 +89,25 @@ struct Inner {
     tx: Option<mpsc::Sender<(Resource, Value)>>,
     pending: Arc<AtomicUsize>,
     pause: Arc<Pause>,
+    remote: Remote,
 }
+
+/// The project's remote settings: what errorgap wants this app to send.
+/// Someone can turn errors, performance data or logs off for a project in
+/// errorgap (Project settings › What SDKs send) and running apps follow
+/// within a poll interval, with no deploy. Until the first answer, and
+/// whenever errorgap cannot be reached, everything stays on.
+#[derive(Default)]
+struct Remote {
+    polling: std::sync::atomic::AtomicBool,
+    errors_off: std::sync::atomic::AtomicBool,
+    apm_off: std::sync::atomic::AtomicBool,
+    logs_off: std::sync::atomic::AtomicBool,
+    interval: std::sync::atomic::AtomicU64,
+}
+
+const DEFAULT_REMOTE_INTERVAL: u64 = 600;
+const MIN_REMOTE_INTERVAL: u64 = 60;
 
 const MAX_ATTEMPTS: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -207,6 +225,7 @@ impl Client {
                 tx,
                 pending,
                 pause,
+                remote: Remote::default(),
             }),
         })
     }
@@ -267,6 +286,88 @@ impl Client {
             }
         }
         Ok(Some(value))
+    }
+
+    /// False only when errorgap has said to stop sending this kind of
+    /// payload. The first call starts the background poll (when a Tokio
+    /// runtime is running).
+    fn remote_enabled(&self, resource: Resource) -> bool {
+        if !self.inner.config.remote_settings() {
+            return true;
+        }
+        let remote = &self.inner.remote;
+        if !remote.polling.swap(true, Ordering::SeqCst) {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                // Weak, so the poll ends with the client instead of keeping
+                // it (and its delivery channel) alive.
+                let weak = Arc::downgrade(&self.inner);
+                handle.spawn(async move {
+                    loop {
+                        let Some(inner) = weak.upgrade() else { break };
+                        let client = Client { inner };
+                        client.refresh_remote_settings().await;
+                        let seconds = client.inner.remote.interval.load(Ordering::SeqCst);
+                        drop(client);
+                        let seconds = if seconds >= MIN_REMOTE_INTERVAL {
+                            seconds
+                        } else {
+                            DEFAULT_REMOTE_INTERVAL
+                        };
+                        tokio::time::sleep(Duration::from_secs(seconds)).await;
+                    }
+                });
+            } else {
+                remote.polling.store(false, Ordering::SeqCst);
+            }
+        }
+        let off = match resource {
+            Resource::Notices => &remote.errors_off,
+            Resource::Transactions => &remote.apm_off,
+            Resource::Logs => &remote.logs_off,
+        };
+        !off.load(Ordering::SeqCst)
+    }
+
+    /// Fetch the project's remote settings now. Returns whether they could
+    /// be read; a failure leaves the last known settings in place.
+    pub async fn refresh_remote_settings(&self) -> bool {
+        let config = &self.inner.config;
+        let url = format!(
+            "{}/api/projects/{}/config",
+            config.endpoint().trim_end_matches('/'),
+            config.project_slug()
+        );
+        let mut request = self.inner.http.get(url);
+        if let Some(api_key) = config.api_key().filter(|key| !key.is_empty()) {
+            request = request.header("x-errorgap-project-key", api_key);
+        }
+        let Ok(response) = request.send().await else {
+            return false;
+        };
+        if response.status().as_u16() != 200 {
+            return false;
+        }
+        let Ok(body) = response.json::<Value>().await else {
+            return false;
+        };
+        if !body.is_object() {
+            return false;
+        }
+        // An absent field means on.
+        let off = |field: &str| body.get(field).and_then(Value::as_bool) == Some(false);
+        let remote = &self.inner.remote;
+        remote
+            .errors_off
+            .store(off("errors_enabled"), Ordering::SeqCst);
+        remote.apm_off.store(off("apm_enabled"), Ordering::SeqCst);
+        remote.logs_off.store(off("logs_enabled"), Ordering::SeqCst);
+        remote.interval.store(
+            body.get("poll_interval_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            Ordering::SeqCst,
+        );
+        true
     }
 
     /// True while delivery is paused at the server's request (a 429 or 503
@@ -372,7 +473,7 @@ impl Client {
     }
 
     fn enqueue(&self, resource: Resource, value: Value) -> DeliveryResult {
-        if self.inner.config.ignored_environment() {
+        if self.inner.config.ignored_environment() || !self.remote_enabled(resource) {
             return DeliveryResult::skipped();
         }
         let Some(tx) = &self.inner.tx else {
@@ -397,7 +498,7 @@ impl Client {
     }
 
     async fn deliver_value_sync(&self, resource: Resource, value: Value) -> DeliveryResult {
-        if self.inner.config.ignored_environment() {
+        if self.inner.config.ignored_environment() || !self.remote_enabled(resource) {
             return DeliveryResult::skipped();
         }
         match deliver_inner(

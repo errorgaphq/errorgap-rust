@@ -139,3 +139,40 @@ async fn sensitive_keys_are_masked_inside_arrays_and_in_the_session() {
     assert_eq!(bodies[0]["params"]["users"][0]["name"], "Ada");
     assert_eq!(bodies[0]["session"]["auth_token"], "[FILTERED]");
 }
+
+#[tokio::test]
+async fn remote_settings_switch_a_kind_off_and_fail_open() {
+    let app = Router::new()
+        .route(
+            "/api/projects/demo/config",
+            axum::routing::get(|| async {
+                r#"{"errors_enabled":false,"apm_enabled":true,"poll_interval_seconds":600}"#
+            }),
+        )
+        .route(
+            "/api/projects/demo/notices",
+            post(|| async { (StatusCode::CREATED, "{}") }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = Client::new(config(&endpoint).remote_settings(true).build().unwrap()).unwrap();
+    assert!(client.refresh_remote_settings().await);
+    let dropped = client.notify_sync("x", NoticeOptions::default()).await;
+    assert_eq!(dropped.status, Some(204), "errors are switched off");
+
+    // Unreachable: nothing is read, and everything stays on.
+    let down = Client::new(
+        config("http://127.0.0.1:1")
+            .remote_settings(true)
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!down.refresh_remote_settings().await);
+    let attempted = down.notify_sync("x", NoticeOptions::default()).await;
+    assert!(attempted.error.is_some(), "sent (and refused), not skipped");
+}

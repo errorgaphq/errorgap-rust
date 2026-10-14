@@ -80,6 +80,14 @@ Leading frames from the error library and the `?` conversion are dropped, so
 the top frame is the code that failed. Build release binaries with
 `debug = "line-tables-only"` to keep file and line numbers.
 
+## Remote settings
+
+Errors, performance data and logs can each be switched off for a project in
+errorgap (Project settings › What SDKs send). Running apps follow within ten
+minutes, with no deploy. If errorgap cannot be reached, everything stays on.
+`.remote_settings(false)` on the builder (or `ERRORGAP_REMOTE_SETTINGS=false`)
+ignores the project's switches.
+
 ## Filtering, hooks and delivery
 
 ```rust

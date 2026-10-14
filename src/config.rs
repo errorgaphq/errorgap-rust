@@ -51,6 +51,7 @@ pub struct Configuration {
     pub(crate) max_breadcrumbs: usize,
     pub(crate) ignore_environments: Vec<String>,
     pub(crate) before_notify: Option<BeforeNotify>,
+    pub(crate) remote_settings: bool,
 }
 
 impl Configuration {
@@ -115,6 +116,10 @@ impl Configuration {
             .any(|name| name == &self.environment)
     }
 
+    pub(crate) fn remote_settings(&self) -> bool {
+        self.remote_settings
+    }
+
     pub(crate) fn before_notify(&self) -> Option<&BeforeNotify> {
         self.before_notify.as_ref()
     }
@@ -161,6 +166,7 @@ pub struct ConfigurationBuilder {
     max_breadcrumbs: Option<usize>,
     ignore_environments: Option<Vec<String>>,
     before_notify: Option<BeforeNotify>,
+    remote_settings: Option<bool>,
 }
 
 impl ConfigurationBuilder {
@@ -275,6 +281,14 @@ impl ConfigurationBuilder {
         self
     }
 
+    /// Follow the project's settings in errorgap (Project settings › What
+    /// SDKs send): stop sending what is switched off there. On by default;
+    /// `ERRORGAP_REMOTE_SETTINGS=false` turns it off.
+    pub fn remote_settings(mut self, follow: bool) -> Self {
+        self.remote_settings = Some(follow);
+        self
+    }
+
     /// See each notice (as JSON) before it is sent. Change it in place;
     /// return `false` to drop it.
     pub fn before_notify<F>(mut self, hook: F) -> Self
@@ -360,6 +374,12 @@ impl ConfigurationBuilder {
                     .collect()
             }),
             before_notify: self.before_notify,
+            remote_settings: self.remote_settings.unwrap_or_else(|| {
+                !std::env::var("ERRORGAP_REMOTE_SETTINGS")
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case("false")
+            }),
         })
     }
 }
